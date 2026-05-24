@@ -1,0 +1,20 @@
+cff-version: 1.2.0
+message: "If you use this software or our methodology, please cite it as below."
+authors:
+  - family-names: "Islam"
+    given-names: "Abrar"
+  - family-names: "Raiyan"
+    given-names: "Syed Shafkat"
+title: "Cross-Basis Projection Feature Encoding (CBPFE): A DLNM-Driven XGBoost Framework for Dengue Forecasting"
+version: 1.0.0
+date-released: "2026-05-24"
+preferred-citation:
+  type: unpublished
+  authors:
+    - family-names: "Islam"
+      given-names: "Abrar"
+    - family-names: "Raiyan"
+      given-names: "Syed Shafkat"
+  title: "Cross-Basis Projection Feature Encoding (CBPFE): A DLNM-Driven XGBoost Framework for Dengue Forecasting"
+  year: 2026
+  notes: "Unpublished manuscript in preparation"
