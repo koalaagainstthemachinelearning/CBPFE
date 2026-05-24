@@ -1,0 +1,1151 @@
+---
+title: "Cross-Basis Projection Feature Encoding (CBPFE): A DLNM-Driven XGBoost Framework for Dengue Forecasting"
+author: "Abrar Islam, Syed Shafkat Raiyan"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    theme: flatly
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE,
+                      fig.width = 10, fig.height = 6)
+```
+
+# Overview
+
+This notebook implements the **Cross-Basis Projection Feature Encoding (CBPFE)** pipeline
+described in Islam & Raiyan (2026). The pipeline has two stages:
+
+- **Stage 1**: Four univariate NB-DLNMs extract nonlinear exposure-lag-response surfaces
+  for mean temperature, precipitation, relative humidity, and wind speed.
+- **Stage 2**: Cross-basis partial effects serve as engineered features for XGBoost
+  forecasting, evaluated on a true 24-month prospective holdout (2024–2025).
+
+All DLNM models used for feature extraction are refit on the training partition only
+(2008–2023) to prevent data leakage into the test set.
+
+---
+
+# 1. Dependencies
+
+```{r packages}
+install_if_missing <- function(pkg) {
+  if (!requireNamespace(pkg, quietly = TRUE))
+    install.packages(pkg, repos = "https://cloud.r-project.org")
+}
+
+pkgs <- c("dlnm", "splines", "MASS", "readxl", "dplyr", "lubridate",
+          "lmtest", "zoo", "car", "xgboost", "ggplot2", "tidyr",
+          "forecast", "SHAPforxgboost", "moments", "scales")
+invisible(lapply(pkgs, install_if_missing))
+
+library(dlnm);        library(splines);    library(MASS)
+library(readxl);      library(dplyr);      library(lubridate)
+library(lmtest);      library(car);        library(zoo)
+library(xgboost);     library(ggplot2);    library(tidyr)
+library(forecast);    library(SHAPforxgboost)
+library(moments);     library(scales)
+```
+
+---
+
+# 2. Data
+
+## 2.1 Load and Prepare
+
+Replace the file paths below with your own data locations.
+Expected columns after loading: `Date`, `DengueCases`, `MeanTemp`, `Precipitation`,
+`Humidity`, `WindSpeed`. Population is merged from a separate annual CSV.
+
+```{r load-data}
+# --- Bangladesh dengue + climate dataset ---
+df_raw <- read_excel("data/dengue_forecasting_dataset.xlsx", skip = 1)
+colnames(df_raw) <- c("Date", "DengueCases", "MeanTemp", "Precipitation",
+                      "Humidity", "WindSpeed", "DengueCases_plus1", "LN_DengueCases")
+df_raw$Date      <- as.Date(df_raw$Date)
+df_raw           <- df_raw %>% arrange(Date)
+df_raw$Year      <- year(df_raw$Date)
+df_raw$Month_num <- month(df_raw$Date)
+df_raw <- df_raw %>%
+  filter(!is.na(DengueCases), !is.na(MeanTemp),
+         !is.na(Precipitation), !is.na(Humidity), !is.na(WindSpeed))
+
+# --- Annual population estimates (World Bank) ---
+pop_df <- read.csv("data/pop_dataset.csv", fileEncoding = "UTF-8-BOM")
+colnames(pop_df)[1] <- "Year"
+pop_df$Population   <- as.numeric(gsub(",", "", pop_df$Population))
+df_raw <- df_raw %>% left_join(pop_df, by = "Year")
+df_raw$Population <- zoo::na.locf(df_raw$Population, na.rm = FALSE)
+df_raw$Population <- zoo::na.locf(df_raw$Population, fromLast = TRUE, na.rm = FALSE)
+if (any(is.na(df_raw$Population))) stop("NA in Population after fill")
+
+df_raw           <- as.data.frame(df_raw)
+df_raw$Month_index <- seq_len(nrow(df_raw))
+
+cat("Rows:", nrow(df_raw), "| Range:",
+    format(min(df_raw$Date)), "to", format(max(df_raw$Date)), "\n")
+```
+
+## 2.2 Descriptive Statistics
+
+```{r descriptive-stats}
+vars_df <- df_raw[, c("DengueCases", "MeanTemp", "Precipitation",
+                      "Humidity", "WindSpeed", "Population")]
+
+desc_stats <- data.frame(
+  Variable = c("Dengue cases (monthly count)", "Mean temperature (°C)",
+               "Precipitation (mm)", "Relative humidity (%)",
+               "Wind speed (m/s)", "Population (millions)"),
+  Mean     = sapply(vars_df, function(x) round(mean(x, na.rm = TRUE), 2)),
+  SD       = sapply(vars_df, function(x) round(sd(x, na.rm = TRUE), 2)),
+  Median   = sapply(vars_df, function(x) round(median(x, na.rm = TRUE), 2)),
+  IQR      = sapply(vars_df, function(x) round(IQR(x, na.rm = TRUE), 2)),
+  Min      = sapply(vars_df, function(x) round(min(x, na.rm = TRUE), 2)),
+  Max      = sapply(vars_df, function(x) round(max(x, na.rm = TRUE), 2)),
+  Skewness = sapply(vars_df, function(x) round(skewness(x, na.rm = TRUE), 2)),
+  Kurtosis = sapply(vars_df, function(x) round(kurtosis(x, na.rm = TRUE), 2))
+)
+
+# Convert population row to millions
+pop_idx <- which(desc_stats$Variable == "Population (millions)")
+desc_stats[pop_idx, c("Mean","SD","Median","IQR","Min","Max")] <-
+  desc_stats[pop_idx, c("Mean","SD","Median","IQR","Min","Max")] / 1e6
+
+knitr::kable(desc_stats, caption = "Table 1: Descriptive statistics (2008–2025, n=216 months)",
+             digits = 2, align = "c")
+```
+
+---
+
+# 3. Global Settings
+
+```{r global-settings}
+lag_period <- 6    # maximum lag window (months); matches A. aegypti full cycle
+max_lags   <- 12   # search range for autocorrelation correction lags
+trend_df   <- 5    # ns() df for long-term trend spline
+
+# Prediction range: 5th–95th percentile (avoids spline boundary artefacts)
+pred_MeanTemp_range  <- quantile(df_raw$MeanTemp,      c(0.05, 0.95))
+pred_Precip_range    <- quantile(df_raw$Precipitation, c(0.05, 0.95))
+pred_Humidity_range  <- quantile(df_raw$Humidity,      c(0.05, 0.95))
+pred_WindSpeed_range <- quantile(df_raw$WindSpeed,     c(0.05, 0.95))
+
+# Reference values: median is used (more robust for right-skewed data)
+ref_MeanTemp  <- median(df_raw$MeanTemp)
+ref_Precip    <- median(df_raw$Precipitation)
+ref_Humidity  <- median(df_raw$Humidity)
+ref_WindSpeed <- median(df_raw$WindSpeed)
+
+cat("Prediction ranges (5th–95th percentile):\n")
+cat("  MeanTemp:     ", round(pred_MeanTemp_range,  2), "°C\n")
+cat("  Precipitation:", round(pred_Precip_range,    2), "mm\n")
+cat("  Humidity:     ", round(pred_Humidity_range,  2), "%\n")
+cat("  WindSpeed:    ", round(pred_WindSpeed_range, 2), "m/s\n")
+cat("\nReference values (medians):\n")
+cat("  MeanTemp:", round(ref_MeanTemp, 2), "°C |",
+    "Precip:", round(ref_Precip, 2), "mm |",
+    "Humidity:", round(ref_Humidity, 2), "% |",
+    "WindSpeed:", round(ref_WindSpeed, 2), "m/s\n")
+
+# Helper: preserve dlnm class/attributes when row-subsetting a crossbasis matrix
+subset_cb <- function(cb, rows) {
+  cb_sub <- cb[rows, , drop = FALSE]
+  for (a in setdiff(names(attributes(cb)), c("dim", "dimnames")))
+    attr(cb_sub, a) <- attr(cb, a)
+  class(cb_sub) <- class(cb)
+  cb_sub
+}
+```
+
+---
+
+# 4. Stage 1 — DLNM Epidemiological Characterisation
+
+Cross-bases are built on the **full 216-row dataset** to ensure every observation
+has a complete 6-month lag history. The first `lag_period` rows are then trimmed
+before model fitting (rows with incomplete lag windows).
+
+## 4.1 Cross-Basis Construction
+
+```{r build-crossbases}
+cb_MT_full <- crossbasis(df_raw$MeanTemp, lag = lag_period,
+  argvar = list(fun = "ns", df = 2, Boundary.knots = pred_MeanTemp_range),
+  arglag = list(fun = "ns", df = 2))
+
+cb_PR_full <- crossbasis(df_raw$Precipitation, lag = lag_period,
+  argvar = list(fun = "ns", df = 3, Boundary.knots = pred_Precip_range),
+  arglag = list(fun = "ns", df = 3))
+
+cb_HU_full <- crossbasis(df_raw$Humidity, lag = lag_period,
+  argvar = list(fun = "ns", df = 3, Boundary.knots = pred_Humidity_range),
+  arglag = list(fun = "ns", df = 3))
+
+# Wind speed: full observed range as boundary knots (22 obs outside 5th–95th pct)
+cb_WS_full <- crossbasis(df_raw$WindSpeed, lag = lag_period,
+  argvar = list(fun = "ns", df = 2, Boundary.knots = range(df_raw$WindSpeed)),
+  arglag = list(fun = "ns", df = 2))
+
+fit_rows <- (lag_period + 1):nrow(df_raw)
+df       <- df_raw[fit_rows, ]
+cb_MT    <- subset_cb(cb_MT_full, fit_rows)
+cb_PR    <- subset_cb(cb_PR_full, fit_rows)
+cb_HU    <- subset_cb(cb_HU_full, fit_rows)
+cb_WS    <- subset_cb(cb_WS_full, fit_rows)
+
+cat("Fitting rows:", nrow(df),
+    "| NA check — MT:", sum(is.na(cb_MT)),
+    "PR:", sum(is.na(cb_PR)),
+    "HU:", sum(is.na(cb_HU)),
+    "WS:", sum(is.na(cb_WS)), "\n")
+```
+
+## 4.2 Autocorrelation Correction (Durbin-Watson grid search)
+
+For each variable: fit a penultimate model, extract deviance residuals, then search
+over k = 1–12 lagged residual terms selecting the k that minimises |DW_k − 2|.
+
+```{r dw-helper}
+# Generic DW grid search: returns best_k and vectors of DW / AIC per k
+dw_grid_search <- function(cb_full, confounders_str, df_all, fit_rows,
+                            res_pent, max_lags, label) {
+  dw_vec  <- numeric(max_lags)
+  aic_vec <- numeric(max_lags)
+
+  for (n_lags in seq_len(max_lags)) {
+    df_t <- df_all
+    for (i in seq_len(n_lags))
+      df_t[[paste0("lr", i)]] <- dplyr::lag(res_pent, i)
+
+    cb_t     <- subset_cb(cb_full, fit_rows)
+    lag_str  <- paste0("lr", seq_len(n_lags), collapse = " + ")
+    fml <- as.formula(paste(
+      "DengueCases ~ ns(Month_index, df=trend_df) + cb_t +",
+      confounders_str, "+", lag_str,
+      "+ factor(Month_num) + offset(log(Population))"
+    ))
+    m <- tryCatch(glm.nb(fml, data = df_t, na.action = na.omit),
+                  error = function(e) NULL)
+    if (is.null(m)) { dw_vec[n_lags] <- NA; aic_vec[n_lags] <- NA; next }
+    aic_vec[n_lags] <- AIC(m)
+    dw_vec[n_lags]  <- dwtest(lm(residuals(m, type = "deviance") ~ 1))$statistic
+  }
+
+  vi       <- which(!is.na(dw_vec))
+  best_k   <- vi[which.min(abs(dw_vec[vi] - 2))]
+  cat(sprintf("  %-15s best_k = %d | DW = %.3f | AIC = %.1f\n",
+              label, best_k, dw_vec[best_k], aic_vec[best_k]))
+  list(best_k = best_k, dw = dw_vec, aic = aic_vec)
+}
+```
+
+## 4.3 Model 1 — Mean Temperature
+
+```{r dlnm-temperature}
+# Penultimate model (no lagged residuals yet)
+MT_penultimate <- glm.nb(
+  DengueCases ~ ns(Month_index, df = trend_df) + cb_MT +
+    Precipitation + Humidity + WindSpeed +
+    factor(Month_num) + offset(log(Population)),
+  data = df
+)
+res_MT <- residuals(MT_penultimate, type = "deviance")
+
+dw_MT   <- dw_grid_search(cb_MT_full, "Precipitation + Humidity + WindSpeed",
+                           df, fit_rows, res_MT, max_lags, "MeanTemp")
+best_MT <- dw_MT$best_k
+
+# Final model
+df_MT <- df
+for (i in seq_len(best_MT)) df_MT[[paste0("lr", i)]] <- dplyr::lag(res_MT, i)
+complete_MT <- complete.cases(df_MT)
+df_MT       <- df_MT[complete_MT, ]
+cb_MT       <- subset_cb(cb_MT_full, fit_rows[complete_MT])
+
+fml_MT <- as.formula(paste(
+  "DengueCases ~ ns(Month_index, df=trend_df) + cb_MT +",
+  "Precipitation + Humidity + WindSpeed +",
+  paste0("lr", seq_len(best_MT), collapse = " + "),
+  "+ factor(Month_num) + offset(log(Population))"
+))
+model_MT <- glm.nb(fml_MT, data = df_MT)
+
+null_MT  <- glm.nb(DengueCases ~ 1 + offset(log(Population)), data = df_MT)
+ll_diff  <- 2 * (as.numeric(logLik(model_MT)) - as.numeric(logLik(null_MT)))
+df_diff  <- attr(logLik(model_MT), "df") - attr(logLik(null_MT), "df")
+cat(sprintf("MeanTemp — AIC: %.1f | DW: %.3f | LR chi2: %.1f (df=%d, p%s)\n",
+    AIC(model_MT),
+    dwtest(lm(residuals(model_MT, type="deviance") ~ 1))$statistic,
+    ll_diff, df_diff,
+    ifelse(pchisq(ll_diff, df_diff, lower.tail=FALSE) < 0.001, " < 0.001",
+           paste0(" = ", round(pchisq(ll_diff, df_diff, lower.tail=FALSE), 4)))))
+
+# Exposure-lag-response surface
+pred_MT <- crosspred(cb_MT, model_MT,
+  at       = seq(pred_MeanTemp_range[1], pred_MeanTemp_range[2], by = 0.1),
+  cumul    = TRUE, cen = ref_MeanTemp, ci.level = 0.95, vcov = vcov(model_MT))
+
+plot(pred_MT, "3d", xlab = "Mean Temp (°C)", ylab = "Lag (months)", zlab = "RR",
+     col = "white", shade = 0.6, theta = -145, phi = 38,
+     main = "Mean Temperature: Exposure-Lag-Response Surface")
+plot(pred_MT, "overall", xlab = "Mean Temperature (°C)", ylab = "Cumulative RR",
+     main = "Mean Temperature: Cumulative Exposure-Response",
+     lwd = 2, col = "darkred",
+     ci.arg = list(col = adjustcolor("red", alpha.f = 0.2)))
+abline(h = 1, lty = 2, col = "grey40"); grid()
+
+# Lag-specific slices
+par(mfrow = c(2, ceiling((lag_period + 1) / 2)))
+for (i in 0:lag_period)
+  plot(pred_MT, "slices", lag = i, ci = "area",
+       xlab = "Mean Temp (°C)", ylab = "RR", main = paste("Lag", i, "month(s)"))
+par(mfrow = c(1, 1))
+```
+
+## 4.4 Model 2 — Precipitation
+
+```{r dlnm-precipitation}
+PR_penultimate <- glm.nb(
+  DengueCases ~ ns(Month_index, df = trend_df) + cb_PR +
+    MeanTemp + Humidity + WindSpeed +
+    factor(Month_num) + offset(log(Population)),
+  data = df
+)
+res_PR <- residuals(PR_penultimate, type = "deviance")
+
+dw_PR   <- dw_grid_search(cb_PR_full, "MeanTemp + Humidity + WindSpeed",
+                           df, fit_rows, res_PR, max_lags, "Precipitation")
+best_PR <- dw_PR$best_k
+
+df_PR <- df
+for (i in seq_len(best_PR)) df_PR[[paste0("lr", i)]] <- dplyr::lag(res_PR, i)
+complete_PR <- complete.cases(df_PR)
+df_PR       <- df_PR[complete_PR, ]
+cb_PR       <- subset_cb(cb_PR_full, fit_rows[complete_PR])
+
+fml_PR <- as.formula(paste(
+  "DengueCases ~ ns(Month_index, df=trend_df) + cb_PR +",
+  "MeanTemp + Humidity + WindSpeed +",
+  paste0("lr", seq_len(best_PR), collapse = " + "),
+  "+ factor(Month_num) + offset(log(Population))"
+))
+model_PR <- glm.nb(fml_PR, data = df_PR)
+
+null_PR  <- glm.nb(DengueCases ~ 1 + offset(log(Population)), data = df_PR)
+ll_diff  <- 2 * (as.numeric(logLik(model_PR)) - as.numeric(logLik(null_PR)))
+df_diff  <- attr(logLik(model_PR), "df") - attr(logLik(null_PR), "df")
+cat(sprintf("Precipitation — AIC: %.1f | DW: %.3f | LR chi2: %.1f (df=%d, p%s)\n",
+    AIC(model_PR),
+    dwtest(lm(residuals(model_PR, type="deviance") ~ 1))$statistic,
+    ll_diff, df_diff,
+    ifelse(pchisq(ll_diff, df_diff, lower.tail=FALSE) < 0.001, " < 0.001",
+           paste0(" = ", round(pchisq(ll_diff, df_diff, lower.tail=FALSE), 4)))))
+
+pred_PR <- crosspred(cb_PR, model_PR,
+  at       = seq(pred_Precip_range[1], pred_Precip_range[2], by = 1),
+  cumul    = TRUE, cen = ref_Precip, ci.level = 0.95, vcov = vcov(model_PR))
+
+plot(pred_PR, "3d", xlab = "Precipitation (mm)", ylab = "Lag (months)", zlab = "RR",
+     col = "white", shade = 0.6, theta = -145, phi = 38,
+     main = "Precipitation: Exposure-Lag-Response Surface")
+plot(pred_PR, "overall", xlab = "Precipitation (mm)", ylab = "Cumulative RR",
+     main = "Precipitation: Cumulative Exposure-Response",
+     lwd = 2, col = "darkblue",
+     ci.arg = list(col = adjustcolor("blue", alpha.f = 0.2)))
+abline(h = 1, lty = 2, col = "grey40"); grid()
+
+par(mfrow = c(2, ceiling((lag_period + 1) / 2)))
+for (i in 0:lag_period)
+  plot(pred_PR, "slices", lag = i, ci = "area",
+       xlab = "Precipitation (mm)", ylab = "RR", main = paste("Lag", i, "month(s)"))
+par(mfrow = c(1, 1))
+```
+
+## 4.5 Model 3 — Relative Humidity
+
+```{r dlnm-humidity}
+HU_penultimate <- glm.nb(
+  DengueCases ~ ns(Month_index, df = trend_df) + cb_HU +
+    MeanTemp + Precipitation + WindSpeed +
+    factor(Month_num) + offset(log(Population)),
+  data = df
+)
+res_HU <- residuals(HU_penultimate, type = "deviance")
+
+dw_HU   <- dw_grid_search(cb_HU_full, "MeanTemp + Precipitation + WindSpeed",
+                           df, fit_rows, res_HU, max_lags, "Humidity")
+best_HU <- dw_HU$best_k
+
+df_HU <- df
+for (i in seq_len(best_HU)) df_HU[[paste0("lr", i)]] <- dplyr::lag(res_HU, i)
+complete_HU <- complete.cases(df_HU)
+df_HU       <- df_HU[complete_HU, ]
+cb_HU       <- subset_cb(cb_HU_full, fit_rows[complete_HU])
+
+fml_HU <- as.formula(paste(
+  "DengueCases ~ ns(Month_index, df=trend_df) + cb_HU +",
+  "MeanTemp + Precipitation + WindSpeed +",
+  paste0("lr", seq_len(best_HU), collapse = " + "),
+  "+ factor(Month_num) + offset(log(Population))"
+))
+model_HU <- glm.nb(fml_HU, data = df_HU)
+
+null_HU  <- glm.nb(DengueCases ~ 1 + offset(log(Population)), data = df_HU)
+ll_diff  <- 2 * (as.numeric(logLik(model_HU)) - as.numeric(logLik(null_HU)))
+df_diff  <- attr(logLik(model_HU), "df") - attr(logLik(null_HU), "df")
+cat(sprintf("Humidity — AIC: %.1f | DW: %.3f | LR chi2: %.1f (df=%d, p%s)\n",
+    AIC(model_HU),
+    dwtest(lm(residuals(model_HU, type="deviance") ~ 1))$statistic,
+    ll_diff, df_diff,
+    ifelse(pchisq(ll_diff, df_diff, lower.tail=FALSE) < 0.001, " < 0.001",
+           paste0(" = ", round(pchisq(ll_diff, df_diff, lower.tail=FALSE), 4)))))
+
+pred_HU <- crosspred(cb_HU, model_HU,
+  at       = seq(pred_Humidity_range[1], pred_Humidity_range[2], by = 0.5),
+  cumul    = TRUE, cen = ref_Humidity, ci.level = 0.95, vcov = vcov(model_HU))
+
+plot(pred_HU, "3d", xlab = "Humidity (%)", ylab = "Lag (months)", zlab = "RR",
+     col = "white", shade = 0.6, theta = -145, phi = 38,
+     main = "Humidity: Exposure-Lag-Response Surface")
+plot(pred_HU, "overall", xlab = "Humidity (%)", ylab = "Cumulative RR",
+     main = "Humidity: Cumulative Exposure-Response",
+     lwd = 2, col = "darkgreen",
+     ci.arg = list(col = adjustcolor("green", alpha.f = 0.2)))
+abline(h = 1, lty = 2, col = "grey40"); grid()
+
+par(mfrow = c(2, ceiling((lag_period + 1) / 2)))
+for (i in 0:lag_period)
+  plot(pred_HU, "slices", lag = i, ci = "area",
+       xlab = "Humidity (%)", ylab = "RR", main = paste("Lag", i, "month(s)"))
+par(mfrow = c(1, 1))
+```
+
+## 4.6 Model 4 — Wind Speed
+
+Wind speed requires Poisson warm-start due to NB convergence issues at this
+temporal resolution.
+
+```{r dlnm-windspeed}
+# Rebuild WS crossbasis with full-range boundary knots
+cb_WS_full <- crossbasis(df_raw$WindSpeed, lag = lag_period,
+  argvar = list(fun = "ns", df = 2, Boundary.knots = range(df_raw$WindSpeed)),
+  arglag = list(fun = "ns", df = 2))
+cb_WS <- subset_cb(cb_WS_full, fit_rows)
+
+# Poisson warm-start for NB convergence
+WS_pois <- glm(
+  DengueCases ~ ns(Month_index, df = trend_df) + cb_WS +
+    MeanTemp + Precipitation + Humidity +
+    factor(Month_num) + offset(log(Population)),
+  data = df, family = poisson, control = glm.control(maxit = 200)
+)
+WS_penultimate <- glm.nb(
+  DengueCases ~ ns(Month_index, df = trend_df) + cb_WS +
+    MeanTemp + Precipitation + Humidity +
+    factor(Month_num) + offset(log(Population)),
+  data = df, start = coef(WS_pois),
+  control = glm.control(maxit = 500, epsilon = 1e-6)
+)
+res_WS <- residuals(WS_penultimate, type = "deviance")
+
+# DW grid search with Poisson warm-start per fold
+dw_WS_vec  <- numeric(max_lags)
+aic_WS_vec <- numeric(max_lags)
+for (n_lags in seq_len(max_lags)) {
+  df_t <- df
+  for (i in seq_len(n_lags)) df_t[[paste0("lr", i)]] <- dplyr::lag(res_WS, i)
+  cb_t     <- subset_cb(cb_WS_full, fit_rows)
+  lag_str  <- paste0("lr", seq_len(n_lags), collapse = " + ")
+  fml <- as.formula(paste(
+    "DengueCases ~ ns(Month_index, df=trend_df) + cb_t +",
+    "MeanTemp + Precipitation + Humidity +", lag_str,
+    "+ factor(Month_num) + offset(log(Population))"
+  ))
+  m <- tryCatch({
+    p <- glm(fml, data = df_t, family = poisson,
+             control = glm.control(maxit = 200), na.action = na.omit)
+    glm.nb(fml, data = df_t, start = coef(p),
+           control = glm.control(maxit = 500, epsilon = 1e-6), na.action = na.omit)
+  }, error = function(e) NULL)
+  if (is.null(m)) { dw_WS_vec[n_lags] <- NA; aic_WS_vec[n_lags] <- NA; next }
+  aic_WS_vec[n_lags] <- AIC(m)
+  dw_WS_vec[n_lags]  <- dwtest(lm(residuals(m, type = "deviance") ~ 1))$statistic
+}
+
+vi       <- which(!is.na(dw_WS_vec))
+best_WS  <- vi[which.min(abs(dw_WS_vec[vi] - 2))]
+cat(sprintf("  %-15s best_k = %d | DW = %.3f\n", "WindSpeed",
+            best_WS, dw_WS_vec[best_WS]))
+
+df_WS <- df
+for (i in seq_len(best_WS)) df_WS[[paste0("lr", i)]] <- dplyr::lag(res_WS, i)
+complete_WS <- complete.cases(df_WS)
+df_WS       <- df_WS[complete_WS, ]
+cb_WS       <- subset_cb(cb_WS_full, fit_rows[complete_WS])
+
+fml_WS <- as.formula(paste(
+  "DengueCases ~ ns(Month_index, df=trend_df) + cb_WS +",
+  "MeanTemp + Precipitation + Humidity +",
+  paste0("lr", seq_len(best_WS), collapse = " + "),
+  "+ factor(Month_num) + offset(log(Population))"
+))
+WS_pois_f <- glm(fml_WS, data = df_WS, family = poisson,
+                 control = glm.control(maxit = 200))
+model_WS  <- glm.nb(fml_WS, data = df_WS,
+                    start = coef(WS_pois_f),
+                    control = glm.control(maxit = 500, epsilon = 1e-6))
+
+null_WS  <- glm.nb(DengueCases ~ 1 + offset(log(Population)), data = df_WS)
+ll_diff  <- 2 * (as.numeric(logLik(model_WS)) - as.numeric(logLik(null_WS)))
+df_diff  <- attr(logLik(model_WS), "df") - attr(logLik(null_WS), "df")
+cat(sprintf("WindSpeed — AIC: %.1f | DW: %.3f | LR chi2: %.1f (df=%d, p%s)\n",
+    AIC(model_WS),
+    dwtest(lm(residuals(model_WS, type="deviance") ~ 1))$statistic,
+    ll_diff, df_diff,
+    ifelse(pchisq(ll_diff, df_diff, lower.tail=FALSE) < 0.001, " < 0.001",
+           paste0(" = ", round(pchisq(ll_diff, df_diff, lower.tail=FALSE), 4)))))
+
+pred_WS <- crosspred(cb_WS, model_WS,
+  at       = seq(pred_WindSpeed_range[1], pred_WindSpeed_range[2], by = 0.05),
+  cumul    = TRUE, cen = ref_WindSpeed, ci.level = 0.95, vcov = vcov(model_WS))
+
+plot(pred_WS, "3d", xlab = "Wind Speed (m/s)", ylab = "Lag (months)", zlab = "RR",
+     col = "white", shade = 0.6, theta = -145, phi = 38,
+     main = "Wind Speed: Exposure-Lag-Response Surface")
+plot(pred_WS, "overall", xlab = "Wind Speed (m/s)", ylab = "Cumulative RR",
+     main = "Wind Speed: Cumulative Exposure-Response",
+     lwd = 2, col = "purple",
+     ci.arg = list(col = adjustcolor("purple", alpha.f = 0.2)))
+abline(h = 1, lty = 2, col = "grey40"); grid()
+```
+
+## 4.7 DLNM Summary
+
+```{r dlnm-summary}
+cat("=== DLNM Model Summary ===\n")
+for (nm in c("MeanTemp","Precipitation","Humidity","WindSpeed")) {
+  mod  <- get(paste0("model_", substr(nm, 1, 2)))
+  best <- get(paste0("best_", substr(nm, 1, 2)))
+  dw_f <- dwtest(lm(residuals(mod, type="deviance") ~ 1))$statistic
+  cat(sprintf("  %-15s | AIC: %8.1f | DW: %.3f | Residual lags: %d\n",
+              nm, AIC(mod), dw_f, best))
+}
+```
+
+---
+
+# 5. Stage 2 — CBPFE: Leakage-Free Feature Extraction
+
+DLNM models are **refit on the training partition only** (Year ≤ 2023).
+Cross-basis partial effects for all rows are then computed via deterministic
+matrix multiplication: `f_t = B_t × β̂`, where `β̂` comes from training data only.
+
+```{r cbpfe-feature-extraction}
+# Align CB matrices with df (210 rows)
+cb_MT_ml <- subset_cb(cb_MT_full, fit_rows)
+cb_PR_ml <- subset_cb(cb_PR_full, fit_rows)
+cb_HU_ml <- subset_cb(cb_HU_full, fit_rows)
+cb_WS_ml <- subset_cb(cb_WS_full, fit_rows)
+
+train_idx_dlnm <- which(df$Year <= 2023)
+cat("Refitting DLNM on training rows:", length(train_idx_dlnm), "(2008–2023)\n")
+
+# Fit training-only DLNM and project partial effects to all rows
+fit_train_dlnm <- function(cb_ml, df_all, train_idx, confounders, label) {
+  cb_tr <- subset_cb(cb_ml, train_idx)
+  df_tr <- df_all[train_idx, ]
+  .GlobalEnv$cb_oos <- cb_tr
+
+  fml <- as.formula(paste0(
+    "DengueCases ~ ns(Month_index, df=", trend_df, ") + cb_oos + ",
+    confounders, " + factor(Month_num) + offset(log(Population))"
+  ))
+  pois <- tryCatch(
+    glm(fml, data = df_tr, family = poisson, control = glm.control(maxit = 200)),
+    error = function(e) NULL)
+  nb <- tryCatch({
+    if (!is.null(pois))
+      glm.nb(fml, data = df_tr, start = coef(pois),
+             control = glm.control(maxit = 500, epsilon = 1e-6))
+    else
+      glm.nb(fml, data = df_tr, control = glm.control(maxit = 500))
+  }, error = function(e) {
+    warning(paste(label, "NB failed; using Poisson")); pois
+  })
+
+  # Step 3 of Algorithm 1: deterministic projection (no future y_t used)
+  cf       <- coef(nb)
+  cb_coefs <- cf[grep("^cb_oos", names(cf))]
+  effect   <- as.numeric(cb_ml %*% cb_coefs)
+  cat(sprintf("  %-15s coefs=%d | effect [%+.3f, %+.3f]\n",
+              label, length(cb_coefs), min(effect), max(effect)))
+  list(model = nb, effect = effect)
+}
+
+dlnm_MT <- fit_train_dlnm(cb_MT_ml, df, train_idx_dlnm,
+                           "Precipitation + Humidity + WindSpeed", "MeanTemp")
+dlnm_PR <- fit_train_dlnm(cb_PR_ml, df, train_idx_dlnm,
+                           "MeanTemp + Humidity + WindSpeed",       "Precipitation")
+dlnm_HU <- fit_train_dlnm(cb_HU_ml, df, train_idx_dlnm,
+                           "MeanTemp + Precipitation + WindSpeed",  "Humidity")
+dlnm_WS <- fit_train_dlnm(cb_WS_ml, df, train_idx_dlnm,
+                           "MeanTemp + Precipitation + Humidity",   "WindSpeed")
+rm(cb_oos, envir = .GlobalEnv)
+
+df$dlnm_effect_MT <- dlnm_MT$effect
+df$dlnm_effect_PR <- dlnm_PR$effect
+df$dlnm_effect_HU <- dlnm_HU$effect
+df$dlnm_effect_WS <- dlnm_WS$effect
+dlnm_effect_cols  <- c("dlnm_effect_MT", "dlnm_effect_PR",
+                        "dlnm_effect_HU", "dlnm_effect_WS")
+cat("\nAll DLNM features are leak-free (trained on 2008–2023 only)\n")
+```
+
+---
+
+# 6. Feature Assembly and Train/Test Split
+
+```{r feature-assembly}
+df_ml <- df
+
+# AR lags on log1p scale (consistent with log-incidence target)
+for (k in c(1:6, 12))
+  df_ml[[paste0("lag", k, "_dengue")]] <- dplyr::lag(log1p(df_ml$DengueCases), k)
+ar_cols     <- paste0("lag", c(1:6, 12), "_dengue")
+
+# Cyclical month encoding
+df_ml$sin_month <- sin(2 * pi * df_ml$Month_num / 12)
+df_ml$cos_month <- cos(2 * pi * df_ml$Month_num / 12)
+season_cols     <- c("sin_month", "cos_month")
+
+# Target: log-incidence per 100,000 population
+df_ml$log_incidence <- log1p(df_ml$DengueCases / df_ml$Population * 1e5)
+
+needed_cols <- c(ar_cols, "log_incidence", dlnm_effect_cols)
+train_df <- df_ml %>% filter(Year <= 2023) %>% tidyr::drop_na(all_of(needed_cols))
+test_df  <- df_ml %>% filter(Year >= 2024) %>% tidyr::drop_na(all_of(needed_cols))
+
+cat("Train:", nrow(train_df), "rows |",
+    format(min(train_df$Date)), "–", format(max(train_df$Date)), "\n")
+cat("Test: ", nrow(test_df),  "rows |",
+    format(min(test_df$Date)),  "–", format(max(test_df$Date)), "\n")
+
+# Three feature sets (Step 4 of Algorithm 1)
+feat_a <- c(ar_cols, season_cols)                          # Model A: AR only
+feat_b <- c(ar_cols, season_cols, dlnm_effect_cols)        # Model B: AR + CBPFE
+ar_reduced <- paste0("lag", c(1, 2, 6, 12), "_dengue")
+feat_c <- c(ar_reduced, season_cols, dlnm_effect_cols)     # Model C: hybrid
+
+cat("\nFeature counts — A:", length(feat_a),
+    "| B:", length(feat_b), "| C:", length(feat_c), "\n")
+```
+
+---
+
+# 7. Helper Functions
+
+```{r helpers}
+# Back-transform log-incidence to absolute case counts
+bt <- function(log_inc, pop) pmax(0, expm1(log_inc) / 1e5 * pop)
+
+# RMSE / MAE / R2
+calc_metrics <- function(actual, pred) {
+  list(rmse = sqrt(mean((actual - pred)^2)),
+       mae  = mean(abs(actual - pred)),
+       r2   = 1 - sum((actual - pred)^2) / sum((actual - mean(actual))^2))
+}
+
+# Time-series CV fold generator
+generate_cv_folds <- function(n, min_train, horizon, step, type = "expanding") {
+  folds <- list()
+  if (type == "expanding") {
+    for (end in seq(min_train, n - horizon, by = step))
+      folds[[length(folds) + 1]] <- list(
+        train = seq_len(end),
+        val   = seq.int(end + 1, min(end + horizon, n)))
+  } else {
+    for (start in seq(1, n - min_train - horizon + 1, by = step)) {
+      tr_end <- start + min_train - 1
+      va_end <- min(tr_end + horizon, n)
+      if (va_end > n) break
+      folds[[length(folds) + 1]] <- list(
+        train = seq.int(start, tr_end),
+        val   = seq.int(tr_end + 1, va_end))
+    }
+  }
+  folds
+}
+
+# Run CV for a given parameter set
+run_cv <- function(train_data, feat_cols, params, folds) {
+  x_full <- as.matrix(train_data[, feat_cols])
+  y_full <- train_data$log_incidence
+  rmse_v <- numeric(length(folds))
+  nr_v   <- integer(length(folds))
+  for (i in seq_along(folds)) {
+    tr <- folds[[i]]$train;  va <- folds[[i]]$val
+    dtr <- xgb.DMatrix(data = x_full[tr, , drop = FALSE], label = y_full[tr])
+    dva <- xgb.DMatrix(data = x_full[va, , drop = FALSE], label = y_full[va])
+    set.seed(42)
+    suppressWarnings(
+      m <- xgb.train(params = params, data = dtr, nrounds = 300,
+                     watchlist = list(val = dva),
+                     early_stopping_rounds = 30, verbose = 0))
+    pred_c      <- bt(predict(m, dva), train_data$Population[va])
+    rmse_v[i]   <- sqrt(mean((train_data$DengueCases[va] - pred_c)^2))
+    nr_v[i]     <- if (!is.null(m$best_iteration) && m$best_iteration > 0)
+                     m$best_iteration else 300L
+  }
+  list(mean_rmse = mean(rmse_v), sd_rmse = sd(rmse_v),
+       rmse_vec = rmse_v, nrounds_vec = nr_v,
+       median_nrounds = as.integer(median(nr_v)),
+       n_folds = length(folds))
+}
+```
+
+---
+
+# 8. Expanding vs Rolling CV Comparison
+
+```{r cv-comparison}
+n_train   <- nrow(train_df)
+min_train <- 48;  horizon_cv <- 12;  step_cv <- 6
+
+folds_expanding <- generate_cv_folds(n_train, min_train, horizon_cv, step_cv, "expanding")
+folds_rolling   <- generate_cv_folds(n_train, min_train, horizon_cv, step_cv, "rolling")
+
+default_params <- list(
+  objective = "reg:squarederror", max_depth = 4, eta = 0.05,
+  subsample = 0.8, colsample_bytree = 0.8,
+  min_child_weight = 5, gamma = 1, lambda = 5
+)
+
+cv_exp <- run_cv(train_df, feat_c, default_params, folds_expanding)
+cv_rol <- run_cv(train_df, feat_c, default_params, folds_rolling)
+
+cat(sprintf("Expanding  | folds=%d | mean RMSE=%.0f | SD=%.0f\n",
+            cv_exp$n_folds, cv_exp$mean_rmse, cv_exp$sd_rmse))
+cat(sprintf("Rolling    | folds=%d | mean RMSE=%.0f | SD=%.0f\n",
+            cv_rol$n_folds, cv_rol$mean_rmse, cv_rol$sd_rmse))
+
+if (cv_exp$mean_rmse <= cv_rol$mean_rmse) {
+  best_cv_type  <- "expanding"; best_cv_folds <- folds_expanding
+} else {
+  best_cv_type  <- "rolling";   best_cv_folds <- folds_rolling
+}
+cat(">>> Selected:", toupper(best_cv_type), "CV\n")
+```
+
+---
+
+# 9. Hyperparameter Tuning (Random Grid Search, n=20)
+
+```{r hyperparameter-tuning}
+set.seed(123)
+n_grid <- 20
+param_grid <- data.frame(
+  max_depth        = sample(c(3,4,5,6),        n_grid, replace = TRUE),
+  eta              = sample(c(0.01,0.03,0.05,0.1), n_grid, replace = TRUE),
+  subsample        = sample(c(0.7,0.8,0.9),    n_grid, replace = TRUE),
+  colsample_bytree = sample(c(0.6,0.8,1.0),    n_grid, replace = TRUE),
+  min_child_weight = sample(c(3,5,10,15),       n_grid, replace = TRUE),
+  gamma            = sample(c(0,0.5,1,3),       n_grid, replace = TRUE),
+  lambda           = sample(c(1,3,5,10),        n_grid, replace = TRUE)
+)
+
+tune_model <- function(train_data, feat_cols, folds, label) {
+  cat(sprintf("Tuning %s (%d features)...\n", label, length(feat_cols)))
+  results <- data.frame()
+  for (j in seq_len(n_grid)) {
+    p_j <- list(objective="reg:squarederror",
+                max_depth=param_grid$max_depth[j], eta=param_grid$eta[j],
+                subsample=param_grid$subsample[j],
+                colsample_bytree=param_grid$colsample_bytree[j],
+                min_child_weight=param_grid$min_child_weight[j],
+                gamma=param_grid$gamma[j], lambda=param_grid$lambda[j])
+    cv_r <- run_cv(train_data, feat_cols, p_j, folds)
+    results <- rbind(results, cbind(param_grid[j, ],
+                     mean_rmse = cv_r$mean_rmse, sd_rmse = cv_r$sd_rmse,
+                     median_nrounds = cv_r$median_nrounds))
+  }
+  best_j <- which.min(results$mean_rmse)
+  cat(sprintf("  Best: RMSE=%.0f | depth=%d eta=%.3f gamma=%.1f lambda=%d nrounds=%d\n",
+              results$mean_rmse[best_j], results$max_depth[best_j],
+              results$eta[best_j], results$gamma[best_j],
+              results$lambda[best_j], results$median_nrounds[best_j]))
+  list(
+    best_params = list(objective="reg:squarederror",
+      max_depth=results$max_depth[best_j], eta=results$eta[best_j],
+      subsample=results$subsample[best_j],
+      colsample_bytree=results$colsample_bytree[best_j],
+      min_child_weight=results$min_child_weight[best_j],
+      gamma=results$gamma[best_j], lambda=results$lambda[best_j]),
+    best_nrounds = results$median_nrounds[best_j],
+    all_results  = results[order(results$mean_rmse), ]
+  )
+}
+
+tuned_a <- tune_model(train_df, feat_a, best_cv_folds, "Model A: AR only")
+tuned_b <- tune_model(train_df, feat_b, best_cv_folds, "Model B: AR + CBPFE")
+tuned_c <- tune_model(train_df, feat_c, best_cv_folds, "Model C: reduced AR + CBPFE")
+
+# Top-3 stability check (confirms hyperparameter sensitivity is low)
+cat("\n=== Top-3 Configurations per Model ===\n")
+for (nm in c("a","b","c")) {
+  cat(sprintf("Model %s:\n", toupper(nm)))
+  print(head(get(paste0("tuned_", nm))$all_results[, c("mean_rmse","max_depth",
+        "eta","gamma","lambda","median_nrounds")], 3), row.names = FALSE)
+}
+```
+
+---
+
+# 10. Final Model Training and Evaluation
+
+```{r final-models}
+start_yr <- as.numeric(format(min(train_df$Date), "%Y"))
+start_mo <- as.numeric(format(min(train_df$Date), "%m"))
+
+fit_final <- function(train_data, test_data, feat_cols,
+                      best_params, best_nrounds, label) {
+  nrounds <- max(50L, best_nrounds)
+  dtrain  <- xgb.DMatrix(data = as.matrix(train_data[, feat_cols]),
+                          label = train_data$log_incidence)
+  dtest   <- xgb.DMatrix(data = as.matrix(test_data[, feat_cols]))
+  set.seed(42)
+  suppressWarnings(
+    model <- xgb.train(params = best_params, data = dtrain,
+                       nrounds = nrounds, verbose = 0))
+  pred_tr   <- bt(predict(model, dtrain), train_data$Population)
+  pred_te   <- bt(predict(model, dtest),  test_data$Population)
+  train_met <- calc_metrics(train_data$DengueCases, pred_tr)
+  test_met  <- calc_metrics(test_data$DengueCases,  pred_te)
+  cat(sprintf("%-40s nrounds=%d\n  Train: RMSE=%.0f MAE=%.0f R2=%.3f\n  Test:  RMSE=%.0f MAE=%.0f R2=%.3f\n",
+              label, nrounds,
+              train_met$rmse, train_met$mae, train_met$r2,
+              test_met$rmse,  test_met$mae,  test_met$r2))
+  list(model=model, feat_cols=feat_cols, train=train_met, test=test_met,
+       pred_train=pred_tr, pred_test=pred_te, nrounds=nrounds)
+}
+
+# Model C: XGBoost + ARIMA residual correction
+fit_final_hybrid <- function(train_data, test_data, feat_cols,
+                              best_params, best_nrounds, label) {
+  nrounds <- max(50L, best_nrounds)
+  dtrain  <- xgb.DMatrix(data = as.matrix(train_data[, feat_cols]),
+                          label = train_data$log_incidence)
+  dtest   <- xgb.DMatrix(data = as.matrix(test_data[, feat_cols]))
+  set.seed(42)
+  suppressWarnings(
+    model <- xgb.train(params = best_params, data = dtrain,
+                       nrounds = nrounds, verbose = 0))
+
+  # ARIMA on XGBoost training residuals
+  resid_tr    <- ts(train_data$log_incidence - predict(model, dtrain),
+                    start = c(start_yr, start_mo), frequency = 12)
+  arima_resid <- auto.arima(resid_tr, seasonal = TRUE,
+                             stepwise = FALSE, approximation = FALSE)
+  resid_fc    <- forecast(arima_resid, h = nrow(test_data))
+  cat(sprintf("  ARIMA residual model: (%s)\n",
+              paste(arimaorder(arima_resid), collapse=",")))
+
+  pred_log_tr <- predict(model, dtrain) + as.numeric(fitted(arima_resid))
+  pred_log_te <- predict(model, dtest)  + as.numeric(resid_fc$mean)
+  pred_tr     <- bt(pred_log_tr, train_data$Population)
+  pred_te     <- bt(pred_log_te, test_data$Population)
+  train_met   <- calc_metrics(train_data$DengueCases, pred_tr)
+  test_met    <- calc_metrics(test_data$DengueCases,  pred_te)
+  cat(sprintf("%-40s nrounds=%d\n  Train: RMSE=%.0f MAE=%.0f R2=%.3f\n  Test:  RMSE=%.0f MAE=%.0f R2=%.3f\n",
+              label, nrounds,
+              train_met$rmse, train_met$mae, train_met$r2,
+              test_met$rmse,  test_met$mae,  test_met$r2))
+  list(model=model, arima_resid=arima_resid, feat_cols=feat_cols,
+       train=train_met, test=test_met,
+       pred_train=pred_tr, pred_test=pred_te, nrounds=nrounds)
+}
+
+model_a <- fit_final(train_df, test_df, feat_a,
+                     tuned_a$best_params, tuned_a$best_nrounds,
+                     "Model A: AR only")
+model_b <- fit_final(train_df, test_df, feat_b,
+                     tuned_b$best_params, tuned_b$best_nrounds,
+                     "Model B: AR + CBPFE")
+model_c <- fit_final_hybrid(train_df, test_df, feat_c,
+                            tuned_c$best_params, tuned_c$best_nrounds,
+                            "Model C: XGB+ARIMA hybrid")
+```
+
+---
+
+# 11. ARIMA-Family Baselines
+
+```{r arima-baselines}
+y_train_ts  <- ts(train_df$log_incidence,
+                  start = c(start_yr, start_mo), frequency = 12)
+exog_cols   <- c(season_cols, dlnm_effect_cols)
+xreg_train  <- as.matrix(train_df[, exog_cols])
+xreg_test   <- as.matrix(test_df[, exog_cols])
+xreg_raw_tr <- as.matrix(train_df[, c("MeanTemp","Precipitation","Humidity","WindSpeed")])
+xreg_raw_te <- as.matrix(test_df[,  c("MeanTemp","Precipitation","Humidity","WindSpeed")])
+
+eval_arima <- function(fit, xreg_te, label, train_data, test_data) {
+  pred_tr  <- bt(as.numeric(fitted(fit)), train_data$Population)
+  fc       <- if (is.null(xreg_te)) forecast(fit, h = nrow(test_data))
+              else                   forecast(fit, xreg = xreg_te, h = nrow(test_data))
+  pred_te  <- bt(as.numeric(fc$mean), test_data$Population)
+  tr_m     <- calc_metrics(train_data$DengueCases, pred_tr)
+  te_m     <- calc_metrics(test_data$DengueCases,  pred_te)
+  lb       <- Box.test(residuals(fit), lag = 20, type = "Ljung-Box")
+  cat(sprintf("%-45s  Train RMSE=%6.0f | Test RMSE=%6.0f R2=%.3f | LB p=%.3f\n",
+              label, tr_m$rmse, te_m$rmse, te_m$r2, lb$p.value))
+  list(train=tr_m, test=te_m, pred_train=pred_tr, pred_test=pred_te,
+       ljung_p=lb$p.value, fit=fit)
+}
+
+fit_arima        <- Arima(y_train_ts, order = c(2,1,2))
+fit_sarima       <- Arima(y_train_ts, order = c(2,1,2),
+                          seasonal = list(order=c(1,1,1), period=6))
+fit_arimax       <- Arima(y_train_ts, order = c(2,1,2), xreg = xreg_train)
+fit_sarimax      <- Arima(y_train_ts, order = c(2,1,2),
+                          seasonal = list(order=c(1,1,1), period=6),
+                          xreg = xreg_train)
+fit_arimax_raw   <- Arima(y_train_ts, order = c(2,1,2), xreg = xreg_raw_tr)
+fit_sarimax_raw  <- Arima(y_train_ts, order = c(2,1,2),
+                          seasonal = list(order=c(1,1,1), period=6),
+                          xreg = xreg_raw_tr)
+
+res_arima       <- eval_arima(fit_arima,       NULL,        "ARIMA(2,1,2)",               train_df, test_df)
+res_sarima      <- eval_arima(fit_sarima,      NULL,        "SARIMA(2,1,2)(1,1,1)[6]",    train_df, test_df)
+res_arimax      <- eval_arima(fit_arimax,      xreg_test,   "ARIMAX(DLNM)",               train_df, test_df)
+res_sarimax     <- eval_arima(fit_sarimax,     xreg_test,   "SARIMAX(DLNM)",              train_df, test_df)
+res_arimax_raw  <- eval_arima(fit_arimax_raw,  xreg_raw_te, "ARIMAX(weather)",            train_df, test_df)
+res_sarimax_raw <- eval_arima(fit_sarimax_raw, xreg_raw_te, "SARIMAX(weather)",           train_df, test_df)
+```
+
+---
+
+# 12. Results Tables
+
+```{r results-tables}
+# XGBoost model comparison
+ml_comp <- data.frame(
+  Model      = c("A: AR only", "B: AR + CBPFE", "C: XGB+ARIMA hybrid"),
+  Features   = c(length(feat_a), length(feat_b), length(feat_c)),
+  Train_RMSE = round(c(model_a$train$rmse, model_b$train$rmse, model_c$train$rmse)),
+  Test_RMSE  = round(c(model_a$test$rmse,  model_b$test$rmse,  model_c$test$rmse)),
+  Test_MAE   = round(c(model_a$test$mae,   model_b$test$mae,   model_c$test$mae)),
+  Test_R2    = round(c(model_a$test$r2,    model_b$test$r2,    model_c$test$r2), 3),
+  Ratio      = round(c(model_a$train$rmse/model_a$test$rmse,
+                        model_b$train$rmse/model_b$test$rmse,
+                        model_c$train$rmse/model_c$test$rmse), 2)
+)
+knitr::kable(ml_comp, caption = "Table 2: XGBoost model comparison (2024–2025 test set)")
+
+# ARIMA comparison
+arima_list  <- list(res_arima, res_sarima, res_arimax, res_sarimax,
+                    res_arimax_raw, res_sarimax_raw)
+arima_names <- c("ARIMA", "SARIMA", "ARIMAX (DLNM)", "SARIMAX (DLNM)",
+                 "ARIMAX (weather)", "SARIMAX (weather)")
+arima_comp  <- data.frame(
+  Model      = arima_names,
+  Train_RMSE = round(sapply(arima_list, function(r) r$train$rmse)),
+  Test_RMSE  = round(sapply(arima_list, function(r) r$test$rmse)),
+  Test_R2    = round(sapply(arima_list, function(r) r$test$r2), 3),
+  LjungBox_p = round(sapply(arima_list, function(r) r$ljung_p), 3)
+)
+knitr::kable(arima_comp, caption = "Table 3: ARIMA-family comparison (2024–2025 test set)")
+```
+
+---
+
+# 13. Forecast Plots
+
+```{r forecast-plots}
+combined_df <- test_df %>%
+  dplyr::select(Date, Actual = DengueCases) %>%
+  mutate(
+    ARIMA               = res_arima$pred_test,
+    SARIMA              = res_sarima$pred_test,
+    `ARIMAX (DLNM)`     = res_arimax$pred_test,
+    `SARIMAX (DLNM)`    = res_sarimax$pred_test,
+    `ARIMAX (weather)`  = res_arimax_raw$pred_test,
+    `SARIMAX (weather)` = res_sarimax_raw$pred_test,
+    `XGB A: AR only`    = model_a$pred_test,
+    `XGB B: AR + CBPFE` = model_b$pred_test,
+    `XGB C: Hybrid`     = model_c$pred_test
+  ) %>%
+  tidyr::pivot_longer(-Date, names_to = "Series", values_to = "Cases") %>%
+  mutate(Series = factor(Series, levels = c(
+    "Actual", "ARIMA", "SARIMA",
+    "ARIMAX (DLNM)", "SARIMAX (DLNM)",
+    "ARIMAX (weather)", "SARIMAX (weather)",
+    "XGB A: AR only", "XGB B: AR + CBPFE", "XGB C: Hybrid")))
+
+ggplot(combined_df, aes(x = Date, y = Cases, colour = Series, linetype = Series)) +
+  geom_line(linewidth = 1.0) + geom_point(size = 1.2) +
+  scale_colour_manual(values = c(
+    "Actual"="black", "ARIMA"="#E69F00", "SARIMA"="#56B4E9",
+    "ARIMAX (DLNM)"="#009E73", "SARIMAX (DLNM)"="#CC79A7",
+    "ARIMAX (weather)"="#D55E00", "SARIMAX (weather)"="#0072B2",
+    "XGB A: AR only"="#F0E442", "XGB B: AR + CBPFE"="#E31A1C",
+    "XGB C: Hybrid"="#984EA3")) +
+  scale_x_date(date_labels = "%b %Y", date_breaks = "2 months") +
+  labs(title = "Dengue Forecasts: 2024–2025 — All Models",
+       subtitle = sprintf("Best ML: Model B (RMSE=%.0f) | Best ARIMA: SARIMAX DLNM (RMSE=%.0f)",
+                          model_b$test$rmse, res_sarimax$test$rmse),
+       x = "Date", y = "Dengue Cases") +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "bottom", plot.title = element_text(face = "bold"),
+        axis.text.x = element_text(angle = 45, hjust = 1)) +
+  guides(colour = guide_legend(nrow = 3), linetype = guide_legend(nrow = 3))
+```
+
+---
+
+# 14. SHAP Explainability (Model B)
+
+SHAP values are computed on the **test set feature matrix** to assess out-of-sample
+feature contributions.
+
+```{r shap-analysis}
+x_test_b  <- as.matrix(test_df[, feat_b])
+shap_b    <- shap.values(xgb_model = model_b$model, X_train = x_test_b)
+
+cat("=== SHAP Feature Importance (Model B, Test Set) ===\n")
+print(round(shap_b$mean_shap_score, 4))
+
+shap_long_b <- shap.prep(shap_contrib = shap_b$shap_score, X_train = x_test_b)
+shap.plot.summary(shap_long_b) +
+  ggtitle("SHAP Summary — Model B: AR + CBPFE (Test Set 2024–2025)")
+
+# Dependence plots for top 4 features
+top4 <- names(shap_b$mean_shap_score)[seq_len(min(4, length(shap_b$mean_shap_score)))]
+for (feat in top4) {
+  print(shap.plot.dependence(shap_long_b, x = feat,
+                              color_feature = "auto", smooth = TRUE, size0 = 1.5) +
+        ggtitle(paste("SHAP Dependence:", feat)))
+}
+```
+
+---
+
+# 15. External Validation — Brazil
+
+```{r external-validation-brazil}
+# Load Brazil dataset (Coelho et al., 2024 — Zenodo DOI: 10.5281/zenodo.13328231)
+brazil_raw          <- read.csv("data/brazil_monthly_dataset.csv")
+brazil_raw$Date     <- as.Date(brazil_raw$month)
+brazil_raw$Year     <- year(brazil_raw$Date)
+brazil_raw$Month_num <- month(brazil_raw$Date)
+names(brazil_raw)[names(brazil_raw) == "cases"]    <- "DengueCases"
+names(brazil_raw)[names(brazil_raw) == "temp"]     <- "MeanTemp"
+names(brazil_raw)[names(brazil_raw) == "rain"]     <- "Precipitation"
+names(brazil_raw)[names(brazil_raw) == "humidity"] <- "Humidity"
+
+# Annual population from World Bank
+brazil_pop <- data.frame(
+  Year       = 2010:2024,
+  Population = c(193701929, 195284734, 196876111, 198478299, 200085127,
+                 201675532, 203218114, 204703445, 206107261, 207455459,
+                 208660842, 209550294, 210306415, 211140729, 211998573)
+)
+brazil_raw <- brazil_raw %>% left_join(brazil_pop, by = "Year")
+
+# Z-score mapping: preserves relative variation, aligns to Bangladesh feature space
+scale_to_bd <- function(bz_vals, bd_vals)
+  (bz_vals - mean(bz_vals, na.rm=TRUE)) / sd(bz_vals, na.rm=TRUE) *
+  sd(bd_vals, na.rm=TRUE) + mean(bd_vals, na.rm=TRUE)
+
+brazil <- brazil_raw
+brazil$MeanTemp      <- scale_to_bd(brazil$MeanTemp,      train_df$MeanTemp)
+brazil$Precipitation <- scale_to_bd(brazil$Precipitation, train_df$Precipitation)
+brazil$Humidity      <- scale_to_bd(brazil$Humidity,      train_df$Humidity)
+brazil$WindSpeed     <- scale_to_bd(brazil$WindSpeed,     train_df$WindSpeed)
+
+# Rebuild crossbases with identical spline specs
+brazil           <- as.data.frame(brazil)
+brazil$Month_index <- seq_len(nrow(brazil))
+cb_MT_bz <- crossbasis(brazil$MeanTemp,      lag=lag_period,
+  argvar=list(fun="ns",df=2,Boundary.knots=pred_MeanTemp_range),
+  arglag=list(fun="ns",df=2))
+cb_PR_bz <- crossbasis(brazil$Precipitation, lag=lag_period,
+  argvar=list(fun="ns",df=3,Boundary.knots=pred_Precip_range),
+  arglag=list(fun="ns",df=3))
+cb_HU_bz <- crossbasis(brazil$Humidity,      lag=lag_period,
+  argvar=list(fun="ns",df=3,Boundary.knots=pred_Humidity_range),
+  arglag=list(fun="ns",df=3))
+cb_WS_bz <- crossbasis(brazil$WindSpeed,     lag=lag_period,
+  argvar=list(fun="ns",df=2,Boundary.knots=range(df$WindSpeed)),
+  arglag=list(fun="ns",df=2))
+
+bz_rows     <- (lag_period + 1):nrow(brazil)
+brazil_fit  <- brazil[bz_rows, ]
+cb_MT_bz    <- subset_cb(cb_MT_bz, bz_rows)
+cb_PR_bz    <- subset_cb(cb_PR_bz, bz_rows)
+cb_HU_bz    <- subset_cb(cb_HU_bz, bz_rows)
+cb_WS_bz    <- subset_cb(cb_WS_bz, bz_rows)
+
+# Extract partial effects using Bangladesh-trained coefficients (Step 3)
+extract_effect <- function(dlnm_obj, cb_bz) {
+  cf       <- coef(dlnm_obj$model)
+  cb_coefs <- cf[grep("^cb_oos", names(cf))]
+  stopifnot(ncol(cb_bz) == length(cb_coefs))
+  as.numeric(cb_bz %*% cb_coefs)
+}
+brazil_fit$dlnm_effect_MT <- extract_effect(dlnm_MT, cb_MT_bz)
+brazil_fit$dlnm_effect_PR <- extract_effect(dlnm_PR, cb_PR_bz)
+brazil_fit$dlnm_effect_HU <- extract_effect(dlnm_HU, cb_HU_bz)
+brazil_fit$dlnm_effect_WS <- extract_effect(dlnm_WS, cb_WS_bz)
+
+brazil_fit$log_incidence <- log1p(brazil_fit$DengueCases / brazil_fit$Population * 1e5)
+for (k in c(1:6, 12))
+  brazil_fit[[paste0("lag", k, "_dengue")]] <- dplyr::lag(
+    log1p(brazil_fit$DengueCases), k)
+brazil_fit$sin_month <- sin(2 * pi * brazil_fit$Month_num / 12)
+brazil_fit$cos_month <- cos(2 * pi * brazil_fit$Month_num / 12)
+
+brazil_valid <- brazil_fit %>%
+  tidyr::drop_na(all_of(c(ar_cols, dlnm_effect_cols, "log_incidence")))
+cat("Brazil rows for prediction:", nrow(brazil_valid), "\n")
+
+pred_log_bz   <- predict(model_b$model,
+                          xgb.DMatrix(as.matrix(brazil_valid[, feat_b])))
+pred_cases_bz <- bt(pred_log_bz, brazil_valid$Population)
+
+bz_m <- calc_metrics(brazil_valid$DengueCases, pred_cases_bz)
+cat(sprintf("\nBrazil external validation:\n  RMSE=%.0f | MAE=%.0f | R2=%.3f\n",
+            bz_m$rmse, bz_m$mae, bz_m$r2))
+cat(sprintf("  Spearman r = %.3f | Pearson r = %.3f\n",
+    cor(brazil_valid$DengueCases, pred_cases_bz, method="spearman"),
+    cor(brazil_valid$DengueCases, pred_cases_bz, method="pearson")))
+
+# Time-series plot (log scale)
+bz_plot <- brazil_valid %>%
+  dplyr::select(Date, Actual = DengueCases) %>%
+  mutate(Predicted = pred_cases_bz) %>%
+  tidyr::pivot_longer(-Date, names_to="Series", values_to="Cases")
+
+ggplot(bz_plot, aes(x=Date, y=Cases, colour=Series, linetype=Series)) +
+  geom_line(linewidth=1.0) + geom_point(size=1.2) +
+  scale_colour_manual(values=c("Actual"="black","Predicted"="#E31A1C")) +
+  scale_y_log10(labels=scales::comma) +
+  scale_x_date(date_labels="%b %Y", date_breaks="12 months") +
+  labs(title="External Validation: Model B on Brazil (log scale)",
+       subtitle=sprintf("Spearman r=%.3f — epidemic timing detection",
+                        cor(brazil_valid$DengueCases, pred_cases_bz, method="spearman")),
+       x="Date", y="Dengue Cases (log scale)") +
+  theme_minimal(base_size=12) +
+  theme(legend.position="bottom", plot.title=element_text(face="bold"),
+        axis.text.x=element_text(angle=45, hjust=1))
+```
+
+---
+
+# Session Info
+
+```{r session-info}
+sessionInfo()
+```
