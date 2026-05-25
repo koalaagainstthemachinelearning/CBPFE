@@ -63,7 +63,7 @@ Expected columns after loading: `Date`, `DengueCases`, `MeanTemp`, `Precipitatio
 
 ```{r load-data}
 # --- Bangladesh dengue + climate dataset ---
-df_raw <- read_excel("data/dengue_forecasting_dataset.xlsx", skip = 1)
+df_raw <- read_excel("dataset/dengue_forecasting_dataset.xlsx", skip = 1)
 colnames(df_raw) <- c("Date", "DengueCases", "MeanTemp", "Precipitation",
                       "Humidity", "WindSpeed", "DengueCases_plus1", "LN_DengueCases")
 df_raw$Date      <- as.Date(df_raw$Date)
@@ -75,7 +75,7 @@ df_raw <- df_raw %>%
          !is.na(Precipitation), !is.na(Humidity), !is.na(WindSpeed))
 
 # --- Annual population estimates (World Bank) ---
-pop_df <- read.csv("data/pop_dataset.csv", fileEncoding = "UTF-8-BOM")
+pop_df <- read.csv("dataset/pop_dataset.csv", fileEncoding = "UTF-8-BOM")
 colnames(pop_df)[1] <- "Year"
 pop_df$Population   <- as.numeric(gsub(",", "", pop_df$Population))
 df_raw <- df_raw %>% left_join(pop_df, by = "Year")
@@ -520,15 +520,27 @@ plot(pred_WS, "overall", xlab = "Wind Speed (m/s)", ylab = "Cumulative RR",
      lwd = 2, col = "purple",
      ci.arg = list(col = adjustcolor("purple", alpha.f = 0.2)))
 abline(h = 1, lty = 2, col = "grey40"); grid()
+
+par(mfrow = c(2, ceiling((lag_period + 1) / 2)))
+for (i in 0:lag_period)
+  plot(pred_WS, "slices", lag = i, ci = "area",
+    xlab = "Wind Speed (m/s)", ylab = "RR", main = paste("Lag", i, "month(s)"))
+par(mfrow = c(1, 1))
 ```
 
 ## 4.7 DLNM Summary
 
 ```{r dlnm-summary}
 cat("=== DLNM Model Summary ===\n")
-for (nm in c("MeanTemp","Precipitation","Humidity","WindSpeed")) {
-  mod  <- get(paste0("model_", substr(nm, 1, 2)))
-  best <- get(paste0("best_", substr(nm, 1, 2)))
+model_map <- list(
+  MeanTemp = list(model = model_MT, best = best_MT),
+  Precipitation = list(model = model_PR, best = best_PR),
+  Humidity = list(model = model_HU, best = best_HU),
+  WindSpeed = list(model = model_WS, best = best_WS)
+)
+for (nm in names(model_map)) {
+  mod  <- model_map[[nm]]$model
+  best <- model_map[[nm]]$best
   dw_f <- dwtest(lm(residuals(mod, type="deviance") ~ 1))$statistic
   cat(sprintf("  %-15s | AIC: %8.1f | DW: %.3f | Residual lags: %d\n",
               nm, AIC(mod), dw_f, best))
@@ -1036,7 +1048,7 @@ for (feat in top4) {
 
 ```{r external-validation-brazil}
 # Load Brazil dataset (Coelho et al., 2024 — Zenodo DOI: 10.5281/zenodo.13328231)
-brazil_raw          <- read.csv("data/brazil_monthly_dataset.csv")
+brazil_raw          <- read.csv("dataset/brazil_monthly_dataset.csv")
 brazil_raw$Date     <- as.Date(brazil_raw$month)
 brazil_raw$Year     <- year(brazil_raw$Date)
 brazil_raw$Month_num <- month(brazil_raw$Date)
