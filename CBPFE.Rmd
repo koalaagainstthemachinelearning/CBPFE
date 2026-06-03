@@ -130,13 +130,14 @@ from visually crushing the real case counts in earlier years.
 
 ```{r ts-overview, fig.height=11, fig.cap="Figure 1: Monthly time series of dengue cases and meteorological variables (2008–2025). Red dashed line = LOESS trend. Dengue panel on log1p scale to reveal early-year case counts."}
 
-# ── Panel A: Dengue — log1p scale ─────────────────────────────────────────────
 p_dengue_ts <- df_raw %>%
   dplyr::select(Date, DengueCases) %>%
+  dplyr::mutate(Panel = "bold('Dengue Cases (count) log'['1p']~'scale')") %>%
   ggplot(aes(x = Date, y = DengueCases + 1)) +
   geom_line(colour = "#2C7BB6", linewidth = 0.65) +
   geom_smooth(method = "loess", span = 0.25, se = FALSE,
               colour = "#D7191C", linewidth = 0.9, linetype = "dashed") +
+  facet_wrap(~ Panel, labeller = label_parsed) +
   scale_x_date(date_labels = "%Y", date_breaks = "2 years",
                limits = c(as.Date("2008-01-01"), NA)) +
   scale_y_continuous(
@@ -145,17 +146,15 @@ p_dengue_ts <- df_raw %>%
     labels = c("0", "10", "100", "1,000", "10,000", "100,000")
   ) +
   labs(x = NULL, y = "Cases") +
-  ggtitle("Dengue Cases (count)  \u2014  log\u2081\u209a scale") +
   theme_minimal(base_size = 11) +
   theme(
-    plot.title         = element_text(face = "bold", size = 10),
+    strip.text         = element_text(face = "bold", size = 10),
     strip.background   = element_rect(fill = "#EEF3F8", colour = NA),
     panel.grid.minor   = element_blank(),
     panel.grid.major.x = element_line(colour = "grey88"),
     axis.text.x        = element_text(angle = 45, hjust = 1, size = 9)
   )
 
-# ── Panel B: Climate variables — linear scale ─────────────────────────────────
 p_climate_ts <- df_raw %>%
   dplyr::select(Date, MeanTemp, Precipitation, Humidity, WindSpeed) %>%
   tidyr::pivot_longer(-Date, names_to = "Variable", values_to = "Value") %>%
@@ -180,7 +179,6 @@ p_climate_ts <- df_raw %>%
     axis.text.x        = element_text(angle = 45, hjust = 1, size = 9)
   )
 
-# ── Combine: dengue ~20% height, climate ~80% ─────────────────────────────────
 gridExtra::grid.arrange(
   p_dengue_ts,
   p_climate_ts,
@@ -220,7 +218,7 @@ ggplot(df_scatter_long, aes(x = Climate_Val, y = DengueCases)) +
   facet_wrap(~ Climate_Var, scales = "free_x", ncol = 2) +
   labs(
     x = NULL,
-    y = expression("Dengue Cases (" * log[10] * " scale)")
+    y = parse(text = "'Dengue Cases (log'*' '['10']~'scale)'")
   ) +
   theme_minimal(base_size = 11) +
   theme(
