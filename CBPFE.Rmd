@@ -125,48 +125,79 @@ knitr::kable(desc_stats, caption = "Table 1: Descriptive statistics (2008–2025
 
 Monthly trajectories of all five study variables across the full 2008–2025 observation
 window. The LOESS smoother (red dashed line) highlights the long-run trend within
-each panel.
+each panel. The dengue panel uses a $\log_{1p}$ scale to prevent the 2023 peak
+from visually crushing the real case counts in earlier years.
 
-```{r ts-overview, fig.height=11, fig.cap="Figure 1: Monthly time series of dengue cases and meteorological variables (2008–2025). Red dashed line = LOESS trend."}
-df_ts_long <- df_raw %>%
-  dplyr::select(Date, DengueCases, MeanTemp, Precipitation, Humidity, WindSpeed) %>%
-  tidyr::pivot_longer(-Date, names_to = "Variable", values_to = "Value") %>%
-  dplyr::mutate(Variable = factor(Variable,
-    levels = c("DengueCases", "MeanTemp", "Precipitation", "Humidity", "WindSpeed"),
-    labels = c("Dengue Cases (count)", "Mean Temperature (\u00b0C)",
-               "Precipitation (mm)", "Relative Humidity (%)", "Wind Speed (m/s)")))
+```{r ts-overview, fig.height=11, fig.cap="Figure 1: Monthly time series of dengue cases and meteorological variables (2008–2025). Red dashed line = LOESS trend. Dengue panel on log1p scale to reveal early-year case counts."}
 
-ggplot(df_ts_long, aes(x = Date, y = Value)) +
+# ── Panel A: Dengue — log1p scale ─────────────────────────────────────────────
+p_dengue_ts <- df_raw %>%
+  dplyr::select(Date, DengueCases) %>%
+  ggplot(aes(x = Date, y = DengueCases + 1)) +
   geom_line(colour = "#2C7BB6", linewidth = 0.65) +
   geom_smooth(method = "loess", span = 0.25, se = FALSE,
               colour = "#D7191C", linewidth = 0.9, linetype = "dashed") +
-  facet_wrap(~ Variable, scales = "free_y", ncol = 1) +
-  scale_x_date(date_labels = "%Y", date_breaks = "2 years") +
-  labs(
-    title   = "",
-    x       = NULL,
-    y       = NULL
+  scale_x_date(date_labels = "%Y", date_breaks = "2 years",
+               limits = c(as.Date("2008-01-01"), NA)) +
+  scale_y_continuous(
+    trans  = "log1p",
+    breaks = c(1, 11, 101, 1001, 10001, 100001),
+    labels = c("0", "10", "100", "1,000", "10,000", "100,000")
   ) +
+  labs(x = NULL, y = "Cases") +
+  ggtitle("Dengue Cases (count)  \u2014  log\u2081\u209a scale") +
   theme_minimal(base_size = 11) +
   theme(
-    strip.text         = element_text(face = "bold", size = 10),
+    plot.title         = element_text(face = "bold", size = 10),
     strip.background   = element_rect(fill = "#EEF3F8", colour = NA),
-    plot.title         = element_text(face = "bold", size = 12, margin = margin(b = 8)),
     panel.grid.minor   = element_blank(),
     panel.grid.major.x = element_line(colour = "grey88"),
     axis.text.x        = element_text(angle = 45, hjust = 1, size = 9)
   )
+
+# ── Panel B: Climate variables — linear scale ─────────────────────────────────
+p_climate_ts <- df_raw %>%
+  dplyr::select(Date, MeanTemp, Precipitation, Humidity, WindSpeed) %>%
+  tidyr::pivot_longer(-Date, names_to = "Variable", values_to = "Value") %>%
+  dplyr::mutate(Variable = factor(Variable,
+    levels = c("MeanTemp", "Precipitation", "Humidity", "WindSpeed"),
+    labels = c("Mean Temperature (\u00b0C)", "Precipitation (mm)",
+               "Relative Humidity (%)", "Wind Speed (m/s)"))) %>%
+  ggplot(aes(x = Date, y = Value)) +
+  geom_line(colour = "#2C7BB6", linewidth = 0.65) +
+  geom_smooth(method = "loess", span = 0.25, se = FALSE,
+              colour = "#D7191C", linewidth = 0.9, linetype = "dashed") +
+  facet_wrap(~ Variable, scales = "free_y", ncol = 1) +
+  scale_x_date(date_labels = "%Y", date_breaks = "2 years",
+               limits = c(as.Date("2008-01-01"), NA)) +
+  labs(x = NULL, y = NULL) +
+  theme_minimal(base_size = 11) +
+  theme(
+    strip.text         = element_text(face = "bold", size = 10),
+    strip.background   = element_rect(fill = "#EEF3F8", colour = NA),
+    panel.grid.minor   = element_blank(),
+    panel.grid.major.x = element_line(colour = "grey88"),
+    axis.text.x        = element_text(angle = 45, hjust = 1, size = 9)
+  )
+
+# ── Combine: dengue ~20% height, climate ~80% ─────────────────────────────────
+gridExtra::grid.arrange(
+  p_dengue_ts,
+  p_climate_ts,
+  nrow    = 2,
+  heights = grid::unit(c(1.2, 4), "null")
+)
 ```
 
 
 ### 2.3.2 Climate–Dengue Bivariate Scatter Plots
 
 Pairwise associations between each meteorological predictor and dengue counts
-(log₁₀ scale; zero-case months excluded for legibility). LOESS curves reveal the
-non-linear exposure–response shapes that motivate the distributed-lag modelling
+($\log_{10}$ scale; zero-case months excluded for legibility). LOESS curves reveal the
+non-linear exposure-response shapes that motivate the distributed-lag modelling
 framework in Stage 1.
 
-```{r climate-dengue-scatter, fig.height=7, fig.cap="Figure 6: Climate variable vs. dengue cases (non-zero months). LOESS smoother with 95% CI; y-axis log10 scale."}
+```{r climate-dengue-scatter, fig.height=7, fig.cap="Figure 2: Climate variable vs. dengue cases (non-zero months). LOESS smoother with 95% CI; y-axis log10 scale."}
 df_scatter_long <- df_raw %>%
   dplyr::filter(DengueCases > 0) %>%
   dplyr::select(DengueCases, MeanTemp, Precipitation, Humidity, WindSpeed) %>%
@@ -178,27 +209,23 @@ df_scatter_long <- df_raw %>%
 
 ggplot(df_scatter_long, aes(x = Climate_Val, y = DengueCases)) +
   geom_point(colour = "#2C7BB6", alpha = 0.55, size = 2.0) +
-  geom_smooth(method  = "loess", span = 0.7,
-              se      = TRUE,
-              colour  = "#D7191C",
-              fill    = "#D7191C",
-              alpha   = 0.15,
+  geom_smooth(method    = "loess", span = 0.7,
+              se        = TRUE,
+              colour    = "#D7191C",
+              fill      = "#D7191C",
+              alpha     = 0.15,
               linewidth = 1.0) +
   scale_y_log10(labels = scales::comma,
                 breaks  = c(1, 10, 100, 1000, 10000, 100000)) +
   facet_wrap(~ Climate_Var, scales = "free_x", ncol = 2) +
   labs(
-    title    = "",
-    subtitle = "",
-    x        = NULL,
-    y        = "Dengue Cases (log\u2081\u2080 scale)"
+    x = NULL,
+    y = expression("Dengue Cases (" * log[10] * " scale)")
   ) +
   theme_minimal(base_size = 11) +
   theme(
     strip.text       = element_text(face = "bold", size = 10),
     strip.background = element_rect(fill = "#EEF3F8", colour = NA),
-    plot.title       = element_text(face = "bold", size = 12, margin = margin(b = 4)),
-    plot.subtitle    = element_text(size = 9, colour = "grey45"),
     panel.grid.minor = element_blank()
   )
 ```
