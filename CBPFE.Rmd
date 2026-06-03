@@ -119,6 +119,90 @@ knitr::kable(desc_stats, caption = "Table 1: Descriptive statistics (2008–2025
              digits = 2, align = "c")
 ```
 
+## 2.3 Data Visualisation
+
+### 2.3.1 Time-Series Overview
+
+Monthly trajectories of all five study variables across the full 2008–2025 observation
+window. The LOESS smoother (red dashed line) highlights the long-run trend within
+each panel.
+
+```{r ts-overview, fig.height=11, fig.cap="Figure 1: Monthly time series of dengue cases and meteorological variables (2008–2025). Red dashed line = LOESS trend."}
+df_ts_long <- df_raw %>%
+  dplyr::select(Date, DengueCases, MeanTemp, Precipitation, Humidity, WindSpeed) %>%
+  tidyr::pivot_longer(-Date, names_to = "Variable", values_to = "Value") %>%
+  dplyr::mutate(Variable = factor(Variable,
+    levels = c("DengueCases", "MeanTemp", "Precipitation", "Humidity", "WindSpeed"),
+    labels = c("Dengue Cases (count)", "Mean Temperature (\u00b0C)",
+               "Precipitation (mm)", "Relative Humidity (%)", "Wind Speed (m/s)")))
+
+ggplot(df_ts_long, aes(x = Date, y = Value)) +
+  geom_line(colour = "#2C7BB6", linewidth = 0.65) +
+  geom_smooth(method = "loess", span = 0.25, se = FALSE,
+              colour = "#D7191C", linewidth = 0.9, linetype = "dashed") +
+  facet_wrap(~ Variable, scales = "free_y", ncol = 1) +
+  scale_x_date(date_labels = "%Y", date_breaks = "2 years") +
+  labs(
+    title   = "",
+    x       = NULL,
+    y       = NULL
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    strip.text         = element_text(face = "bold", size = 10),
+    strip.background   = element_rect(fill = "#EEF3F8", colour = NA),
+    plot.title         = element_text(face = "bold", size = 12, margin = margin(b = 8)),
+    panel.grid.minor   = element_blank(),
+    panel.grid.major.x = element_line(colour = "grey88"),
+    axis.text.x        = element_text(angle = 45, hjust = 1, size = 9)
+  )
+```
+
+
+### 2.3.2 Climate–Dengue Bivariate Scatter Plots
+
+Pairwise associations between each meteorological predictor and dengue counts
+(log₁₀ scale; zero-case months excluded for legibility). LOESS curves reveal the
+non-linear exposure–response shapes that motivate the distributed-lag modelling
+framework in Stage 1.
+
+```{r climate-dengue-scatter, fig.height=7, fig.cap="Figure 6: Climate variable vs. dengue cases (non-zero months). LOESS smoother with 95% CI; y-axis log10 scale."}
+df_scatter_long <- df_raw %>%
+  dplyr::filter(DengueCases > 0) %>%
+  dplyr::select(DengueCases, MeanTemp, Precipitation, Humidity, WindSpeed) %>%
+  tidyr::pivot_longer(-DengueCases, names_to = "Climate_Var", values_to = "Climate_Val") %>%
+  dplyr::mutate(Climate_Var = factor(Climate_Var,
+    levels = c("MeanTemp", "Precipitation", "Humidity", "WindSpeed"),
+    labels = c("Mean Temperature (\u00b0C)", "Precipitation (mm)",
+               "Relative Humidity (%)", "Wind Speed (m/s)")))
+
+ggplot(df_scatter_long, aes(x = Climate_Val, y = DengueCases)) +
+  geom_point(colour = "#2C7BB6", alpha = 0.55, size = 2.0) +
+  geom_smooth(method  = "loess", span = 0.7,
+              se      = TRUE,
+              colour  = "#D7191C",
+              fill    = "#D7191C",
+              alpha   = 0.15,
+              linewidth = 1.0) +
+  scale_y_log10(labels = scales::comma,
+                breaks  = c(1, 10, 100, 1000, 10000, 100000)) +
+  facet_wrap(~ Climate_Var, scales = "free_x", ncol = 2) +
+  labs(
+    title    = "",
+    subtitle = "",
+    x        = NULL,
+    y        = "Dengue Cases (log\u2081\u2080 scale)"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    strip.text       = element_text(face = "bold", size = 10),
+    strip.background = element_rect(fill = "#EEF3F8", colour = NA),
+    plot.title       = element_text(face = "bold", size = 12, margin = margin(b = 4)),
+    plot.subtitle    = element_text(size = 9, colour = "grey45"),
+    panel.grid.minor = element_blank()
+  )
+```
+
 ---
 
 # 3. Global Settings
@@ -903,7 +987,15 @@ xreg_test   <- as.matrix(test_df[, exog_cols])
 xreg_raw_tr <- as.matrix(train_df[, c("MeanTemp","Precipitation","Humidity","WindSpeed")])
 xreg_raw_te <- as.matrix(test_df[,  c("MeanTemp","Precipitation","Humidity","WindSpeed")])
 
-eval_arima <- function(fit, xreg_te, label, train_data, test_data) {
+compute_vif <- function(xreg_mat) {
+  if (is.null(xreg_mat) || ncol(xreg_mat) < 2) return(NULL)
+  cor_mat  <- cor(xreg_mat, use = "complete.obs")
+  vif_vals <- tryCatch(diag(solve(cor_mat)), error = function(e) NULL)
+  if (!is.null(vif_vals)) names(vif_vals) <- colnames(xreg_mat)
+  vif_vals
+}
+
+eval_arima <- function(fit, xreg_tr, xreg_te, label, train_data, test_data) {
   pred_tr  <- bt(as.numeric(fitted(fit)), train_data$Population)
   fc       <- if (is.null(xreg_te)) forecast(fit, h = nrow(test_data))
               else                   forecast(fit, xreg = xreg_te, h = nrow(test_data))
@@ -913,8 +1005,23 @@ eval_arima <- function(fit, xreg_te, label, train_data, test_data) {
   lb       <- Box.test(residuals(fit), lag = 20, type = "Ljung-Box")
   cat(sprintf("%-45s  Train RMSE=%6.0f | Test RMSE=%6.0f R2=%.3f | LB p=%.3f\n",
               label, tr_m$rmse, te_m$rmse, te_m$r2, lb$p.value))
-  list(train=tr_m, test=te_m, pred_train=pred_tr, pred_test=pred_te,
-       ljung_p=lb$p.value, fit=fit)
+
+  vif_vals <- compute_vif(xreg_tr)
+  max_vif  <- if (!is.null(vif_vals)) max(vif_vals) else NA_real_
+
+  if (!is.na(max_vif)) {
+    cat(sprintf("  VIF (max): %.2f %s\n", max_vif,
+      ifelse(max_vif > 10, "[WARN: severe multicollinearity]",
+      ifelse(max_vif > 5,  "[CAUTION: moderate]", "[OK]"))))
+    vif_df <- data.frame(Variable = names(vif_vals), VIF = round(vif_vals, 2))
+    print(head(vif_df[order(-vif_df$VIF), ], 5), row.names = FALSE)
+  } else {
+    cat("  VIF: N/A (no exogenous regressors)\n")
+  }
+
+  list(train = tr_m, test = te_m, pred_train = pred_tr, pred_test = pred_te,
+       ljung_p = lb$p.value, fit = fit,
+       max_vif = max_vif, vif_vals = vif_vals)
 }
 
 fit_arima        <- Arima(y_train_ts, order = c(2,1,2))
@@ -929,12 +1036,12 @@ fit_sarimax_raw  <- Arima(y_train_ts, order = c(2,1,2),
                           seasonal = list(order=c(1,1,1), period=6),
                           xreg = xreg_raw_tr)
 
-res_arima       <- eval_arima(fit_arima,       NULL,        "ARIMA(2,1,2)",               train_df, test_df)
-res_sarima      <- eval_arima(fit_sarima,      NULL,        "SARIMA(2,1,2)(1,1,1)[6]",    train_df, test_df)
-res_arimax      <- eval_arima(fit_arimax,      xreg_test,   "ARIMAX(DLNM)",               train_df, test_df)
-res_sarimax     <- eval_arima(fit_sarimax,     xreg_test,   "SARIMAX(DLNM)",              train_df, test_df)
-res_arimax_raw  <- eval_arima(fit_arimax_raw,  xreg_raw_te, "ARIMAX(weather)",            train_df, test_df)
-res_sarimax_raw <- eval_arima(fit_sarimax_raw, xreg_raw_te, "SARIMAX(weather)",           train_df, test_df)
+res_arima   <- eval_arima(fit_arima,   NULL,        NULL,        "ARIMA(2,1,2)",            train_df, test_df)
+res_sarima  <- eval_arima(fit_sarima,  NULL,        NULL,        "SARIMA(2,1,2)(1,1,1)[6]", train_df, test_df)
+res_arimax  <- eval_arima(fit_arimax,  xreg_train,  xreg_test,   "ARIMAX(DLNM)",            train_df, test_df)
+res_sarimax <- eval_arima(fit_sarimax, xreg_train,  xreg_test,   "SARIMAX(DLNM)",           train_df, test_df)
+res_arimax_raw  <- eval_arima(fit_arimax_raw,  xreg_raw_tr, xreg_raw_te, "ARIMAX(weather)", train_df, test_df)
+res_sarimax_raw <- eval_arima(fit_sarimax_raw, xreg_raw_tr, xreg_raw_te, "SARIMAX(weather)",train_df, test_df)
 ```
 
 ---
@@ -966,7 +1073,8 @@ arima_comp  <- data.frame(
   Train_RMSE = round(sapply(arima_list, function(r) r$train$rmse)),
   Test_RMSE  = round(sapply(arima_list, function(r) r$test$rmse)),
   Test_R2    = round(sapply(arima_list, function(r) r$test$r2), 3),
-  LjungBox_p = round(sapply(arima_list, function(r) r$ljung_p), 3)
+  LjungBox_p = round(sapply(arima_list, function(r) r$ljung_p), 3),
+  Max_VIF    = round(sapply(arima_list, function(r) r$max_vif), 2)
 )
 knitr::kable(arima_comp, caption = "Table 3: ARIMA-family comparison (2024–2025 test set)")
 ```
