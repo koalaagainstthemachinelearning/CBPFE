@@ -63,7 +63,15 @@ Expected columns after loading: `Date`, `DengueCases`, `MeanTemp`, `Precipitatio
 
 ```{r load-data}
 # --- Bangladesh dengue + climate dataset ---
-df_raw <- read_excel("dataset/dengue_forecasting_dataset.xlsx", skip = 1)
+data_dir <- if (dir.exists("dataset")) {
+  "dataset"
+} else if (dir.exists("CBPFE-main/dataset")) {
+  "CBPFE-main/dataset"
+} else {
+  stop("Could not find the dataset directory")
+}
+
+df_raw <- read_excel(file.path(data_dir, "dengue_forecasting_dataset.xlsx"), skip = 1)
 colnames(df_raw) <- c("Date", "DengueCases", "MeanTemp", "Precipitation",
                       "Humidity", "WindSpeed", "DengueCases_plus1", "LN_DengueCases")
 df_raw$Date      <- as.Date(df_raw$Date)
@@ -75,7 +83,7 @@ df_raw <- df_raw %>%
          !is.na(Precipitation), !is.na(Humidity), !is.na(WindSpeed))
 
 # --- Annual population estimates (World Bank) ---
-pop_df <- read.csv("dataset/pop_dataset.csv", fileEncoding = "UTF-8-BOM")
+pop_df <- read.csv(file.path(data_dir, "pop_dataset.csv"), fileEncoding = "UTF-8-BOM")
 colnames(pop_df)[1] <- "Year"
 pop_df$Population   <- as.numeric(gsub(",", "", pop_df$Population))
 df_raw <- df_raw %>% left_join(pop_df, by = "Year")
@@ -924,7 +932,7 @@ for (nm in c("a","b","c")) {
 
 ---
 
-# 10. Final Model Training and Evaluation
+# 10 (A). Final Model Training and Evaluation
 
 ```{r final-models}
 start_yr <- as.numeric(format(min(train_df$Date), "%Y"))
@@ -999,6 +1007,80 @@ model_c <- fit_final_hybrid(train_df, test_df, feat_c,
                             "Model C: XGB+ARIMA hybrid")
 ```
 
+
+# 10 (B). Walk-Forward Prospective Evaluation 
+
+```{r Walk-Forward Prospective Evaluation}
+train_end_years <- c(2019, 2021, 2023)
+wf_results <- data.frame()
+
+for (t_year in train_end_years) {
+
+  cat(sprintf("\nWalk-Forward Window: Train <= %d | Test %d–%d\n\n", 
+              t_year, t_year + 1, t_year + 2))
+  
+  # STEP A: Leakage-Free DLNM Refitting
+  train_idx_wf <- which(df$Year <= t_year)
+  
+  d_MT <- fit_train_dlnm(cb_MT_ml, df, train_idx_wf, "Precipitation + Humidity + WindSpeed", "MeanTemp")
+  d_PR <- fit_train_dlnm(cb_PR_ml, df, train_idx_wf, "MeanTemp + Humidity + WindSpeed", "Precipitation")
+  d_HU <- fit_train_dlnm(cb_HU_ml, df, train_idx_wf, "MeanTemp + Precipitation + WindSpeed", "Humidity")
+  d_WS <- fit_train_dlnm(cb_WS_ml, df, train_idx_wf, "MeanTemp + Precipitation + Humidity", "WindSpeed")
+  
+  # STEP B: Feature Assembly for Current Window
+  df_wf <- df
+  df_wf$dlnm_effect_MT <- d_MT$effect
+  df_wf$dlnm_effect_PR <- d_PR$effect
+  df_wf$dlnm_effect_HU <- d_HU$effect
+  df_wf$dlnm_effect_WS <- d_WS$effect
+  
+  for (k in c(1:6, 12)) {
+    df_wf[[paste0("lag", k, "_dengue")]] <- dplyr::lag(log1p(df_wf$DengueCases), k)
+  }
+  df_wf$sin_month <- sin(2 * pi * df_wf$Month_num / 12)
+  df_wf$cos_month <- cos(2 * pi * df_wf$Month_num / 12)
+  df_wf$log_incidence <- log1p(df_wf$DengueCases / df_wf$Population * 1e5)
+  
+  df_ml_wf <- df_wf %>% tidyr::drop_na(all_of(needed_cols))
+  
+  w_train <- df_ml_wf %>% filter(Year <= t_year)
+  w_test  <- df_ml_wf %>% filter(Year %in% c(t_year + 1, t_year + 2))
+  
+  # STEP C: Strict Leakage-Free Hyperparameter Tuning
+  cat(sprintf("\nTuning Models for Window ending %d\n", t_year))
+  
+  wf_folds <- generate_cv_folds(nrow(w_train), min_train=48, horizon=12, step=6, type=best_cv_type)
+  
+  tuned_wf_a <- tune_model(w_train, feat_a, wf_folds, "Model A (WF)")
+  tuned_wf_b <- tune_model(w_train, feat_b, wf_folds, "Model B (WF)")
+  tuned_wf_c <- tune_model(w_train, feat_c, wf_folds, "Model C (WF)")
+  
+  # STEP D: Train Temporary XGBoost Models 
+  cat(sprintf("\nEvaluating Models for Test %d-%d\n", t_year + 1, t_year + 2))
+  wf_mod_a <- fit_final(w_train, w_test, feat_a, tuned_wf_a$best_params, tuned_wf_a$best_nrounds, "Model A: AR only")
+  wf_mod_b <- fit_final(w_train, w_test, feat_b, tuned_wf_b$best_params, tuned_wf_b$best_nrounds, "Model B: AR + CBPFE")
+  wf_mod_c <- fit_final_hybrid(w_train, w_test, feat_c, tuned_wf_c$best_params, tuned_wf_c$best_nrounds, "Model C: XGB+ARIMA hybrid")
+  
+  # STEP E: Store Metrics
+  loop_metrics <- data.frame(
+    Test_Window = paste0((t_year + 1), "-", (t_year + 2)),
+    Model       = c("A: AR only", "B: AR + CBPFE", "C: XGB+ARIMA hybrid"),
+    RMSE        = c(wf_mod_a$test$rmse, wf_mod_b$test$rmse, wf_mod_c$test$rmse),
+    MAE         = c(wf_mod_a$test$mae, wf_mod_b$test$mae, wf_mod_c$test$mae),
+    R2          = c(wf_mod_a$test$r2, wf_mod_b$test$r2, wf_mod_c$test$r2)
+  )
+  
+  wf_results <- rbind(wf_results, loop_metrics)
+}
+
+# Final Walk-Forward Table
+wf_results_clean <- wf_results %>%
+  mutate(across(where(is.numeric), ~round(., 2))) %>%
+  arrange(Test_Window, Model)
+
+cat("\nFinal Walk-Forward Performance (Separate Windows)\n\n")
+knitr::kable(wf_results_clean, caption = "Walk-Forward Model Comparison (Strict Dynamic Tuning)")
+```
 ---
 
 # 11. ARIMA-Family Baselines
@@ -1181,7 +1263,7 @@ for (feat in top4) {
 
 ```{r external-validation-brazil}
 # Load Brazil dataset (Coelho et al., 2024 — Zenodo DOI: 10.5281/zenodo.13328231)
-brazil_raw          <- read.csv("dataset/brazil_monthly_dataset.csv")
+brazil_raw          <- read.csv(file.path(data_dir, "brazil_monthly_dataset.csv"))
 brazil_raw$Date     <- as.Date(brazil_raw$month)
 brazil_raw$Year     <- year(brazil_raw$Date)
 brazil_raw$Month_num <- month(brazil_raw$Date)
